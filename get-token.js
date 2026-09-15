@@ -20,7 +20,10 @@
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
+const os = require('os');
 const { spawn } = require('child_process');
+
+let popupSeq = 0;
 
 const CDP_PORT = Number(process.env.CDP_PORT || 62000);
 const CDP_URL = `ws://127.0.0.1:${CDP_PORT}`;
@@ -315,6 +318,45 @@ async function findMiniappTargets() {
   return pages.filter((x) => appidOf(x.url) === FILTER_APPID);
 }
 
+/**
+ * 弹一个 Windows 消息框。
+ * 光在控制台打印提示容易被忽略——用户看到窗口没动静就走了，
+ * 然后报"没检测到小程序"。弹窗能确保他看到。
+ * 用 detached 异步弹，不阻塞下面的轮询。
+ */
+function popup(title, text) {
+  if (process.platform !== 'win32') return;
+  try {
+    // 中文不能走命令行参数（编码会被破坏），所以：
+    //   .ps1 脚本保持纯 ASCII，中文放 UTF-8 数据文件里传进去。
+    const stamp = `${process.pid}_${++popupSeq}`;
+    const dir = os.tmpdir();
+    const ps1 = path.join(dir, `wxtoken_popup_${stamp}.ps1`);
+    const msg = path.join(dir, `wxtoken_popup_${stamp}.txt`);
+
+    fs.writeFileSync(ps1, [
+      '$f = $args[0]',
+      "$c = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) -split \"`n\", 2",
+      'Add-Type -AssemblyName PresentationFramework',
+      '[System.Windows.MessageBox]::Show($c[1], $c[0]) | Out-Null',
+    ].join('\r\n'), 'utf8');
+
+    fs.writeFileSync(msg, `${title}\n${text}`, 'utf8');
+
+    const child = spawn('powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1, msg],
+      { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+
+    // 弹窗进程退出后清掉临时文件
+    child.on('exit', () => {
+      for (const f of [ps1, msg]) { try { fs.unlinkSync(f); } catch (_) { /* 忽略 */ } }
+    });
+  } catch (_) {
+    /* 弹不出来不影响主流程，控制台提示还在 */
+  }
+}
+
 function announceWaiting() {
   console.log('还没检测到小程序。\n');
   console.log('>>> 现在请在 PC 微信里打开你要提取 token 的那个小程序。');
@@ -326,6 +368,19 @@ function announceWaiting() {
     console.log('    · 不确定是哪个？任意一个都行，脚本会自己找 token');
   }
   console.log('');
+
+  popup('请打开微信小程序', [
+    '现在需要你做一件事：',
+    '',
+    '1. 打开 PC 版微信',
+    '2. 把要提取 token 的小程序【关掉再重新打开】',
+    '3. 停在页面上，等这里自动出结果',
+    '',
+    '为什么要重开：调试服务只对启动之后新打开的小程序生效。',
+    '如果你之前就开着它，必须先关掉重开，否则读不到。',
+    '',
+    '（本窗口可以先不管，点确定后去操作微信即可）',
+  ].join('\n'));
 }
 
 // ---------- 提取 token ----------
@@ -392,6 +447,7 @@ async function main() {
   let announced = false;
   let sawMiniapp = false;
   let lastErr = null;
+  let lastNudge = 0;
   const seenAppids = new Set();
 
   // 「等小程序出现」和「读它」放在同一个循环里：
@@ -443,6 +499,19 @@ async function main() {
     } else if (!announced) {
       announceWaiting();
       announced = true;
+      lastNudge = Date.now();
+    } else if (Date.now() - lastNudge > 90000) {
+      // 90 秒还没动静，再弹一次 —— 用户多半没注意到第一次的提示
+      console.log('（还没检测到小程序，再次提醒）');
+      popup('还没检测到小程序', [
+        '请在 PC 版微信里打开目标小程序。',
+        '',
+        '如果它本来就开着，必须先【关掉再重新打开】，',
+        '否则脚本读不到。',
+        '',
+        '打开后停在页面上等几秒即可，不用再操作这个窗口。',
+      ].join('\n'));
+      lastNudge = Date.now();
     }
 
     process.stdout.write('.');
