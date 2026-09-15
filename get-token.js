@@ -10,6 +10,11 @@
  * 依赖 WMPFDebugger —— 微信小程序调试工具，作者 evi0s，GPLv2：
  *   https://github.com/evi0s/WMPFDebugger
  * 本脚本不包含其任何代码，仅通过 WebSocket 连接其 CDP 代理。
+ *
+ * 用法：
+ *   node get-token.js                        # 任意已打开的小程序
+ *   node get-token.js --appid wx8e8598...    # 只认指定小程序
+ *   node get-token.js --wait 120             # 等待秒数，默认 60
  */
 
 const path = require('path');
@@ -21,6 +26,78 @@ const CDP_PORT = Number(process.env.CDP_PORT || 62000);
 const CDP_URL = `ws://127.0.0.1:${CDP_PORT}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- 命令行参数 ----------
+const argv = process.argv.slice(2);
+
+function argValue(names) {
+  for (let i = 0; i < argv.length; i++) {
+    for (const n of names) {
+      if (argv[i] === n) return argv[i + 1];
+      if (argv[i].startsWith(n + '=')) return argv[i].slice(n.length + 1);
+    }
+  }
+  return null;
+}
+
+if (argv.includes('--help') || argv.includes('-h')) {
+  console.log(`
+微信小程序 Token 提取工具
+
+用法：
+  node get-token.js [选项]
+
+选项：
+  --appid <appid>   只认指定的小程序（不知道可以不加，默认认任意小程序）
+  --wait <秒>       等待小程序的秒数，默认 60
+  --stop-server     结束后台的调试服务后退出
+  --help, -h        显示本帮助
+
+示例：
+  node get-token.js
+  node get-token.js --appid wx8e8598deed63f9b1
+  node get-token.js --stop-server
+
+说明：
+  自动拉起的调试服务会留在后台，这样下次运行不需要重开小程序。
+  想关掉它用 --stop-server。
+`);
+  process.exit(0);
+}
+
+const FILTER_APPID = argValue(['--appid', '-a']) || process.env.APPID || null;
+const WAIT_SECONDS = Number(argValue(['--wait', '-w']) || 60);
+const STOP_SERVER = argv.includes('--stop-server');
+
+// 按端口找到监听进程并结束它（用于 --stop-server）
+function killByPort(port) {
+  const { execSync } = require('child_process');
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8' });
+      const pids = new Set();
+      for (const line of out.split(/\r?\n/)) {
+        if (!/LISTENING/.test(line)) continue;
+        const parts = line.trim().split(/\s+/);
+        pids.add(parts[parts.length - 1]);
+      }
+      for (const pid of pids) {
+        try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); } catch (_) { /* 忽略 */ }
+      }
+      return pids.size;
+    }
+    execSync(`lsof -ti tcp:${port} | xargs -r kill -9`, { stdio: 'ignore' });
+    return 1;
+  } catch (_) {
+    return 0;
+  }
+}
+
+if (STOP_SERVER) {
+  const n = killByPort(CDP_PORT);
+  console.log(n ? `已结束调试服务（端口 ${CDP_PORT}）。` : `端口 ${CDP_PORT} 上没有正在运行的调试服务。`);
+  process.exit(0);
+}
 
 // ---------- 定位 WMPFDebugger 目录 ----------
 function findDebuggerDir() {
@@ -82,15 +159,18 @@ async function ensureServer() {
     process.platform === 'win32' ? 'ts-node.cmd' : 'ts-node'
   );
 
+  // detached + unref：让服务独立于本脚本存活，脚本退出后它继续跑
+  const base = { cwd: dir, stdio: 'ignore', windowsHide: true, detached: true };
+
   let cmd, args, opts;
   if (fs.existsSync(binJs)) {
     cmd = process.execPath;
     args = [binJs, 'src/index.ts'];
-    opts = { cwd: dir, stdio: 'ignore', windowsHide: true };
+    opts = { ...base };
   } else if (fs.existsSync(shim)) {
     cmd = shim;
     args = ['src/index.ts'];
-    opts = { cwd: dir, stdio: 'ignore', shell: true, windowsHide: true };
+    opts = { ...base, shell: true };
   } else {
     console.error('WMPFDebugger 的依赖没装好（找不到 ts-node）。');
     console.error('请先进它的目录执行：yarn install');
@@ -99,6 +179,7 @@ async function ensureServer() {
 
   console.log('调试服务未运行，正在自动启动…');
   spawnedServer = spawn(cmd, args, opts);
+  spawnedServer.unref();
   spawnedServer.on('error', (e) => {
     console.error('启动调试服务失败：' + e.message);
     process.exit(1);
@@ -109,7 +190,8 @@ async function ensureServer() {
     await sleep(500);
     if (await isPortOpen(CDP_PORT)) {
       await sleep(2000); // 再等 frida 把钩子挂稳
-      console.log('调试服务已启动。\n');
+      console.log('调试服务已启动（会留在后台，下次运行无需重开小程序）。');
+      console.log('想关掉它：node get-token.js --stop-server\n');
       return;
     }
   }
@@ -121,7 +203,11 @@ async function ensureServer() {
   process.exit(1);
 }
 
+// 默认把自动拉起的服务留在后台：否则下次运行小程序又变成「服务启动前就开着」，
+// 而 frida 只对服务启动后新开的小程序生效 —— 用户就得反复关掉重开小程序。
+// 想关掉用 --stop-server。
 function cleanup() {
+  if (!STOP_SERVER) return;
   if (spawnedServer && !spawnedServer.killed) {
     try { spawnedServer.kill(); } catch (_) { /* 忽略 */ }
   }
@@ -206,6 +292,10 @@ async function evaluate(expression, contextId) {
 }
 
 // ---------- 找小程序 target ----------
+function appidOf(url) {
+  return (url.match(/servicewechat\.com\/(wx[0-9a-f]+)/) || [])[1] || null;
+}
+
 // 注意：小程序还没挂上时，Target.getTargets 会直接挂起而不是返回空列表，
 // 所以这里把超时当成「暂时没有小程序」处理，交给外层轮询重试。
 async function findMiniappTargets() {
@@ -216,25 +306,26 @@ async function findMiniappTargets() {
     return [];
   }
   const infos = (t.result && t.result.targetInfos) || [];
-  return infos.filter((x) => x.type === 'page' && /servicewechat\.com\//.test(x.url));
+  // 只认带 appid 的页面。servicewechat.com 下还有 preload-NN 这类预加载页，
+  // 它们不是真正运行的小程序，attach 上去求值会挂住。
+  const pages = infos.filter(
+    (x) => x.type === 'page' && /servicewechat\.com\/wx[0-9a-f]+\//.test(x.url)
+  );
+  if (!FILTER_APPID) return pages;
+  return pages.filter((x) => appidOf(x.url) === FILTER_APPID);
 }
 
-async function waitForMiniapp(timeoutMs = 60000) {
-  const deadline = Date.now() + timeoutMs;
-  let firstTry = true;
-
-  while (Date.now() < deadline) {
-    const pages = await findMiniappTargets();
-    if (pages.length) return pages;
-
-    if (firstTry) {
-      console.log('还没检测到小程序。请在微信里打开目标小程序…');
-      firstTry = false;
-    }
-    process.stdout.write('.');
-    await sleep(2000);
+function announceWaiting() {
+  console.log('还没检测到小程序。\n');
+  console.log('>>> 现在请在 PC 微信里打开你要提取 token 的那个小程序。');
+  console.log('    · 打开后停留几秒，让页面加载完');
+  console.log('    · 如果它已经开着，请先关掉再重新打开（重要）');
+  if (FILTER_APPID) {
+    console.log(`    · 本脚本只认 appid: ${FILTER_APPID}`);
+  } else {
+    console.log('    · 不确定是哪个？任意一个都行，脚本会自己找 token');
   }
-  return [];
+  console.log('');
 }
 
 // ---------- 提取 token ----------
@@ -279,8 +370,7 @@ async function extractFrom(page) {
     const token = data[tokenKey];
     if (typeof token !== 'string' || token.length < 8) continue;
 
-    const appid = (page.url.match(/servicewechat\.com\/(wx[0-9a-f]+)/) || [])[1] || '未知';
-    return { token, tokenKey, appid, data };
+    return { token, tokenKey, appid: appidOf(page.url) || '未知', data };
   }
   return null;
 }
@@ -298,52 +388,89 @@ async function main() {
 
   console.log('已连接调试服务，正在查找小程序…\n');
 
-  const pages = await waitForMiniapp(60000);
-  if (!pages.length) {
-    console.log('\n');
-    console.error('等了 60 秒也没检测到小程序。可能原因：');
-    console.error('  1. 小程序没打开 —— 在微信里打开它，然后重新运行本脚本');
-    console.error('  2. 调试服务刚启动，但小程序是之前就开着的 —— 关掉小程序重新打开');
-    console.error('  3. 微信版本与 WMPFDebugger 不兼容');
-    process.exit(1);
-  }
-  console.log('\n');
+  const deadline = Date.now() + WAIT_SECONDS * 1000;
+  let announced = false;
+  let sawMiniapp = false;
+  let lastErr = null;
+  const seenAppids = new Set();
 
-  for (const page of pages) {
-    const result = await extractFrom(page);
-    if (!result) continue;
+  // 「等小程序出现」和「读它」放在同一个循环里：
+  // 小程序刚打开时页面往往还没初始化完，attach 会失败，需要反复重试。
+  while (Date.now() < deadline) {
+    const pages = await findMiniappTargets();
 
-    const { token, tokenKey, appid, data } = result;
+    if (pages.length) {
+      sawMiniapp = true;
+      for (const page of pages) {
+        const a = appidOf(page.url);
+        if (a) seenAppids.add(a);
+      }
 
-    console.log('='.repeat(64));
-    console.log('  找到 Token');
-    console.log('='.repeat(64));
-    console.log('');
-    console.log(token);
-    console.log('');
-    console.log('-'.repeat(64));
-    console.log(`  小程序   ${appid}`);
-    console.log(`  字段     ${tokenKey}`);
-    console.log(`  长度     ${token.length} 字符`);
-    if (data.userInfo && typeof data.userInfo === 'object') {
-      const u = data.userInfo;
-      const who = [u.studentName || u.nickName || u.name, u.studentId, u.schoolName]
-        .filter(Boolean).join(' / ');
-      if (who) console.log(`  账号     ${who}`);
+      for (const page of pages) {
+        let result = null;
+        try {
+          result = await extractFrom(page);
+        } catch (e) {
+          lastErr = e.message; // 这个 target 还没就绪，下一轮再试
+          continue;
+        }
+        if (!result) continue;
+
+        const { token, tokenKey, appid, data } = result;
+
+        console.log('\n' + '='.repeat(64));
+        console.log('  找到 Token');
+        console.log('='.repeat(64));
+        console.log('');
+        console.log(token);
+        console.log('');
+        console.log('-'.repeat(64));
+        console.log(`  小程序   ${appid}`);
+        console.log(`  字段     ${tokenKey}`);
+        console.log(`  长度     ${token.length} 字符`);
+        if (data.userInfo && typeof data.userInfo === 'object') {
+          const u = data.userInfo;
+          const who = [u.studentName || u.nickName || u.name, u.studentId, u.schoolName]
+            .filter(Boolean).join(' / ');
+          if (who) console.log(`  账号     ${who}`);
+        }
+        console.log('-'.repeat(64));
+        console.log('');
+        console.log('把上面那串 token 完整复制粘贴到登录框即可。');
+        console.log('');
+        process.exit(0);
+      }
+    } else if (!announced) {
+      announceWaiting();
+      announced = true;
     }
-    console.log('-'.repeat(64));
-    console.log('');
-    console.log('把上面那串 token 完整复制粘贴到登录框即可。');
-    console.log('');
 
-    cleanup();
-    process.exit(0);
+    process.stdout.write('.');
+    await sleep(2500);
   }
 
-  console.error('找到了小程序，但没能从它里面读出 token。可能原因：');
-  console.error('  1. 目标小程序还没登录（先在小程序里完成登录）');
-  console.error('  2. 该小程序的 token 没有存在 storage 里');
-  cleanup();
+  console.log('\n');
+  if (sawMiniapp) {
+    console.error(`检测到了小程序，但 ${WAIT_SECONDS} 秒内始终没能读出 token。\n`);
+    console.error('可能原因：');
+    console.error('  1. 小程序还没登录 —— 先在它里面完成登录，再重跑本脚本');
+    console.error('  2. token 没有存在 storage 里（有些小程序只放内存）');
+    console.error('  3. 页面还没加载完 —— 多等一会儿，或加大 --wait');
+    if (lastErr) console.error(`\n最后一次错误：${lastErr}`);
+    if (seenAppids.size > 1) {
+      console.error('\n本次检测到多个小程序，可以指定其中一个重试：');
+      for (const a of seenAppids) console.error(`  --appid ${a}`);
+    }
+  } else {
+    console.error(`等了 ${WAIT_SECONDS} 秒也没检测到小程序。\n`);
+    console.error('请检查：');
+    console.error('  1. 小程序到底开了没有 —— 要在 PC 版微信里打开，不是手机');
+    console.error('  2. 小程序是不是"之前就开着" —— frida 只对调试服务启动后');
+    console.error('     新打开的小程序生效，务必关掉重开一次');
+    console.error('  3. 用了 --appid 的话，确认 appid 没写错');
+    console.error('  4. 微信版本与 WMPFDebugger 是否兼容');
+    console.error(`\n想多等一会儿可以加参数：node get-token.js --wait 180`);
+  }
   process.exit(1);
 }
 
